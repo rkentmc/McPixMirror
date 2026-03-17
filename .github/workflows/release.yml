@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"  # triggers on v0.1.0, v1.2.3, etc.
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # Run full CI suite first                                              #
+  # ------------------------------------------------------------------ #
+  test:
+    name: Lint & Test
+    uses: ./.github/workflows/ci.yml
+
+  # ------------------------------------------------------------------ #
+  # Build the .app bundle and publish a GitHub Release                  #
+  # ------------------------------------------------------------------ #
+  build:
+    name: Build & Release
+    needs: test
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Briefcase
+        run: pip install briefcase
+
+      - name: Build .app bundle
+        run: briefcase build macOS
+
+      - name: Package as .dmg
+        run: briefcase package macOS
+
+      # Optional code-signing step.
+      # Requires a Developer ID certificate stored as GitHub Actions secrets:
+      #   APPLE_CERT_BASE64  — base64-encoded .p12 certificate
+      #   APPLE_CERT_PASSWORD — certificate password
+      #
+      # Uncomment to enable:
+      #
+      # - name: Import signing certificate
+      #   run: |
+      #     echo "${{ secrets.APPLE_CERT_BASE64 }}" | base64 --decode > cert.p12
+      #     security create-keychain -p "" build.keychain
+      #     security import cert.p12 -k build.keychain -P "${{ secrets.APPLE_CERT_PASSWORD }}" -T /usr/bin/codesign
+      #     security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+      #     security default-keychain -s build.keychain
+      #
+      # - name: Sign .app
+      #   run: |
+      #     codesign --force --deep --sign "Developer ID Application: YOUR NAME" \
+      #       "macOS/McPixMirror/McPixMirror.app"
+
+      - name: Find built artifacts
+        id: find_artifacts
+        run: |
+          DMG=$(find . -name "*.dmg" | head -1)
+          echo "dmg_path=$DMG" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find_artifacts.outputs.dmg_path }}
+          body: |
+            ## McPixMirror ${{ github.ref_name }}
+
+            ### Installation
+            1. Download and open the `.dmg` below.
+            2. Drag **McPixMirror** to `/Applications`.
+            3. Right-click > **Open** (required on first launch — app is not notarized yet).
+            4. Run: `brew install android-platform-tools scrcpy`
+            5. On your Pixel: **Settings → Developer Options → Wireless Debugging → Enable**
+            6. Pair once via `adb pair IP:PORT`, then McPixMirror handles reconnections automatically.
+
+            ### What's new
+            See [CHANGELOG.md](CHANGELOG.md) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

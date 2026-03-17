@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "mcpixmirror"
+version = "0.1.0"
+description = "Secure ADB-over-Wi-Fi bridge between macOS and Pixel devices"
+requires-python = ">=3.11"
+dependencies = [
+    "rumps>=0.4.0",
+    "zeroconf>=0.132.0",
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.scripts]
+mcpixmirror = "mcpixmirror.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcpixmirror*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+# briefcase packaging config
+[tool.briefcase]
+project_name = "McPixMirror"
+bundle = "com.mcpixmirror"
+version = "0.1.0"
+url = "https://github.com/yourusername/McPixMirror"
+license = "MIT"
+author = "McPixMirror Contributors"
+author_email = "you@example.com"
+
+[tool.briefcase.app.mcpixmirror]
+formal_name = "McPixMirror"
+description = "Secure ADB-over-Wi-Fi bridge between macOS and Pixel devices"
+icon = "assets/icon"
+sources = ["mcpixmirror"]
+
+[tool.briefcase.app.mcpixmirror.macOS]
+requires = ["rumps>=0.4.0", "zeroconf>=0.132.0"]
