@@ -42,6 +42,7 @@ poll_interval_seconds = 5
 @dataclass
 class SecurityConfig:
     known_ssids: list[str] = field(default_factory=list)
+    known_gateway_macs: list[str] = field(default_factory=list)
     known_serial: str = ""
 
 
@@ -99,6 +100,7 @@ class AppConfig:
         lines = [
             "[security]\n",
             f"known_ssids = {self.security.known_ssids!r}\n",
+            f"known_gateway_macs = {self.security.known_gateway_macs!r}\n",
             f'known_serial = "{self.security.known_serial}"\n',
             "\n[paths]\n",
             f'adb = "{self.paths.adb}"\n',
@@ -126,6 +128,7 @@ def load() -> AppConfig:
     return AppConfig(
         security=SecurityConfig(
             known_ssids=sec.get("known_ssids", []),
+            known_gateway_macs=sec.get("known_gateway_macs", []),
             known_serial=sec.get("known_serial", ""),
         ),
         paths=PathsConfig(

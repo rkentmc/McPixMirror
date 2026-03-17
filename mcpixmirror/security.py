@@ -1,11 +1,22 @@
 """Security guards: trusted-network check and device serial pinning.
 
 Two independent gates must pass before any ADB connection is allowed:
-  1. SSID guard  — the Mac must be on a known, trusted Wi-Fi network.
-  2. Serial pin  — the discovered device serial must match the stored serial
-                   (or no serial is stored yet, triggering a first-use prompt).
+  1. Network guard — the Mac must be on a trusted network, identified by
+                     the default gateway's MAC address (ARP). This works
+                     on all macOS versions without location permission.
+                     Falls back to SSID check (known_ssids) if gateway
+                     MAC is not yet stored.
+  2. Serial pin   — the discovered device serial must match the stored serial
+                     (or no serial is stored yet, triggering a first-use prompt).
 
 Neither gate is bypassed in any code path.
+
+Why gateway MAC instead of SSID?
+  macOS 13+ requires Location Services permission to read the Wi-Fi SSID
+  via networksetup or CoreWLAN, and Terminal does not appear in Location
+  Services until it explicitly requests location access. The router's MAC
+  address is readable via ARP without any special permissions, is unique
+  to the physical router, and is harder to spoof than an SSID.
 """
 
 from __future__ import annotations
@@ -21,55 +32,105 @@ class SecurityError(Exception):
 
 
 # ------------------------------------------------------------------ #
-# SSID guard                                                           #
+# Gateway MAC detection                                               #
 # ------------------------------------------------------------------ #
 
 
-def current_ssid() -> str:
-    """Return the SSID of the current Wi-Fi network, or '' if not associated.
+def gateway_mac() -> str:
+    """Return the MAC address of the default gateway, or '' on failure.
 
-    Uses `networksetup -getairportnetwork en0` which is available on all
-    macOS versions and requires no elevated permissions.
+    Steps:
+      1. `route get default` → parse the gateway IP
+      2. `arp -n <gateway-ip>` → parse the MAC address
+
+    No elevated permissions or location access required.
     """
     try:
-        result = subprocess.run(
-            ["networksetup", "-getairportnetwork", "en0"],
-            capture_output=True,
-            text=True,
-            timeout=5,
+        route = subprocess.run(
+            ["route", "get", "default"],
+            capture_output=True, text=True, timeout=5,
         )
-        # Output format: "Current Wi-Fi Network: MyNetwork"
-        # Or: "You are not associated with an AirPort network."
-        match = re.search(r"Current Wi-Fi Network:\s*(.+)", result.stdout)
-        if match:
-            return match.group(1).strip()
-        return ""
+        match = re.search(r"gateway:\s*(\S+)", route.stdout)
+        if not match:
+            return ""
+        gw_ip = match.group(1)
+
+        arp = subprocess.run(
+            ["arp", "-n", gw_ip],
+            capture_output=True, text=True, timeout=5,
+        )
+        mac_match = re.search(r"(?:ether|at)\s+([0-9a-f:]{17})", arp.stdout)
+        return mac_match.group(1) if mac_match else ""
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ""
 
 
+# ------------------------------------------------------------------ #
+# Network trust check                                                  #
+# ------------------------------------------------------------------ #
+
+
 def on_trusted_network() -> bool:
-    """Return True only if the current SSID is in the known_ssids allowlist."""
-    if not cfg.security.known_ssids:
-        # No SSIDs configured yet — fail safe (deny all).
-        return False
-    ssid = current_ssid()
-    return ssid in cfg.security.known_ssids
+    """Return True if the current network is trusted.
+
+    Trust is established by gateway MAC address stored in known_gateway_macs.
+    Falls back to known_ssids list if no MACs are configured yet (first-run).
+    """
+    known_macs = cfg.security.known_gateway_macs
+
+    if known_macs:
+        mac = gateway_mac()
+        return bool(mac) and mac in known_macs
+
+    # Legacy / first-run fallback: SSID-based check
+    if cfg.security.known_ssids:
+        ssid = _current_ssid()
+        return bool(ssid) and ssid in cfg.security.known_ssids
+
+    # Nothing configured yet — fail safe
+    return False
 
 
 def assert_trusted_network() -> None:
     """Raise SecurityError if not on a trusted network."""
     if not on_trusted_network():
-        ssid = current_ssid()
-        if ssid:
-            raise SecurityError(
-                f"SSID '{ssid}' is not in the trusted list. "
-                "Add it in Settings to enable ADB connections."
-            )
         raise SecurityError(
-            "Not connected to Wi-Fi or SSID unavailable. "
-            "Connect to a trusted network first."
+            "Not on a trusted network. "
+            "Connect to your home network and ensure it is added in Settings."
         )
+
+
+def _current_ssid() -> str:
+    """Best-effort SSID read via networksetup (may return '' on macOS 13+)."""
+    try:
+        result = subprocess.run(
+            ["networksetup", "-getairportnetwork", "en0"],
+            capture_output=True, text=True, timeout=5,
+        )
+        match = re.search(r"Current Wi-Fi Network:\s*(.+)", result.stdout)
+        return match.group(1).strip() if match else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+# ------------------------------------------------------------------ #
+# First-use: learn the current network                                #
+# ------------------------------------------------------------------ #
+
+
+def learn_current_network() -> str:
+    """Record the current gateway MAC as trusted. Returns the MAC or ''.
+
+    Called once when the user clicks "Trust Network" in the app.
+    """
+    mac = gateway_mac()
+    if not mac:
+        return ""
+    macs = cfg.security.known_gateway_macs
+    if mac not in macs:
+        macs.append(mac)
+        cfg.save()
+    return mac
 
 
 # ------------------------------------------------------------------ #
@@ -87,11 +148,7 @@ def first_use_serial_pin(serial: str, device_name: str) -> bool:
     """Prompt the user to trust a new device serial on first connection.
 
     Returns True if the user accepts (serial is saved), False otherwise.
-
-    This is called once per lifetime of the installation when known_serial
-    is empty. After the user confirms, the serial is persisted to config.
     """
-    # Import here to avoid AppKit import at module level in tests.
     import rumps  # type: ignore[import]
 
     response = rumps.alert(
@@ -106,8 +163,8 @@ def first_use_serial_pin(serial: str, device_name: str) -> bool:
         ok="Trust Device",
         cancel="Cancel",
     )
-    if response:  # rumps.alert returns 1 for OK, 0 for Cancel
-        cfg.known_serial = serial  # also saves to disk
+    if response:
+        cfg.known_serial = serial
         return True
     return False
 
@@ -118,7 +175,6 @@ def assert_trusted_serial(serial: str, device_name: str) -> None:
     On first use (no serial stored), triggers the trust prompt.
     """
     if not cfg.security.known_serial:
-        # First-ever connection — prompt the user.
         if not first_use_serial_pin(serial, device_name):
             raise SecurityError("Device not trusted by user.")
         return

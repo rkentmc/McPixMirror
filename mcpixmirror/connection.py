@@ -131,7 +131,8 @@ class AdbConnection:
 
             # Verify: the device at this address must report the expected serial.
             # This guards against MITM or accidentally connecting to the wrong device.
-            actual_serial = _adb("-s", address, "get-serialno")
+            # get-serialno returns IP:PORT over TCP/IP; use getprop instead
+            actual_serial = _adb("-s", address, "shell", "getprop", "ro.serialno")
             if actual_serial != device.serial:
                 _adb("disconnect", address)
                 raise SecurityError(

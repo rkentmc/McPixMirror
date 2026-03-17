@@ -26,7 +26,7 @@ def _patched_connect(mock_adb, device=DEVICE):
         mock_adb.side_effect = [
             "",  # disconnect mDNS transport (best-effort)
             "connected to 192.168.1.212:40235",  # adb connect
-            device.serial,  # adb -s IP:PORT get-serialno
+            device.serial,  # adb -s IP:PORT shell getprop ro.serialno
         ]
         conn.connect(device)
     return conn
