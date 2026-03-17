@@ -1,18 +1,19 @@
-"""Tests for mcpixmirror.discovery — mDNS serial extraction and event queuing."""
+"""Tests for mcpixmirror.discovery — dns-sd serial extraction and event queuing."""
 
 import queue
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
+import subprocess
 
 import pytest
 
 from mcpixmirror.discovery import (
-    ADB_CONNECT_TYPE,
+    ADB_SERVICE_TYPE,
     DeviceDiscovery,
     DeviceEvent,
     DeviceInfo,
     EventKind,
-    _AdbServiceListener,
     _extract_serial,
+    _resolve_hostname,
 )
 
 
@@ -32,8 +33,7 @@ def test_extract_serial_parses_short_serial():
 
 
 def test_extract_serial_returns_none_for_unrelated_service():
-    name = "somedevice._http._tcp.local."
-    assert _extract_serial(name) is None
+    assert _extract_serial("somedevice._http._tcp.local.") is None
 
 
 def test_extract_serial_returns_none_for_empty_string():
@@ -41,91 +41,19 @@ def test_extract_serial_returns_none_for_empty_string():
 
 
 # ------------------------------------------------------------------ #
-# _AdbServiceListener                                                  #
+# _resolve_hostname                                                    #
 # ------------------------------------------------------------------ #
 
 
-def _make_mock_service_info(ip: str, port: int, device_name: str) -> MagicMock:
-    info = MagicMock()
-    info.parsed_scoped_addresses.return_value = [ip]
-    info.port = port
-    info.properties = {b"name": device_name.encode()}
-    return info
+def test_resolve_hostname_returns_ip():
+    with patch("mcpixmirror.discovery.socket.getaddrinfo") as mock_gai:
+        mock_gai.return_value = [(None, None, None, None, ("192.168.1.212", 0))]
+        assert _resolve_hostname("Android.local") == "192.168.1.212"
 
 
-def test_listener_add_service_queues_added_event():
-    q: queue.Queue[DeviceEvent] = queue.Queue()
-    listener = _AdbServiceListener(q)
-
-    service_name = "adb-27021FDH200461-Idi6fc._adb-tls-connect._tcp.local."
-    mock_info = _make_mock_service_info("192.168.1.212", 40235, "Pixel 7")
-
-    mock_zc = MagicMock()
-    mock_zc.get_service_info.return_value = mock_info
-
-    listener.add_service(mock_zc, ADB_CONNECT_TYPE, service_name)
-
-    assert not q.empty()
-    event = q.get_nowait()
-    assert event.kind == EventKind.ADDED
-    assert event.device.serial == "27021FDH200461"
-    assert event.device.ip == "192.168.1.212"
-    assert event.device.port == 40235
-    assert event.device.name == "Pixel 7"
-    assert event.device.service_name == service_name
-
-
-def test_listener_add_service_ignores_unresolvable():
-    q: queue.Queue[DeviceEvent] = queue.Queue()
-    listener = _AdbServiceListener(q)
-
-    mock_zc = MagicMock()
-    mock_zc.get_service_info.return_value = None  # can't resolve
-
-    service_name = "adb-SERIAL-XXXX._adb-tls-connect._tcp.local."
-    listener.add_service(mock_zc, ADB_CONNECT_TYPE, service_name)
-
-    assert q.empty()
-
-
-def test_listener_add_service_ignores_non_adb_records():
-    q: queue.Queue[DeviceEvent] = queue.Queue()
-    listener = _AdbServiceListener(q)
-
-    mock_zc = MagicMock()
-    mock_zc.get_service_info.return_value = _make_mock_service_info("1.2.3.4", 80, "Printer")
-
-    listener.add_service(mock_zc, "_http._tcp.local.", "printer._http._tcp.local.")
-    assert q.empty()
-
-
-def test_listener_remove_service_queues_removed_event():
-    q: queue.Queue[DeviceEvent] = queue.Queue()
-    listener = _AdbServiceListener(q)
-
-    service_name = "adb-27021FDH200461-Idi6fc._adb-tls-connect._tcp.local."
-    listener.remove_service(MagicMock(), ADB_CONNECT_TYPE, service_name)
-
-    assert not q.empty()
-    event = q.get_nowait()
-    assert event.kind == EventKind.REMOVED
-    assert event.device.serial == "27021FDH200461"
-
-
-def test_listener_update_service_treats_as_re_add():
-    q: queue.Queue[DeviceEvent] = queue.Queue()
-    listener = _AdbServiceListener(q)
-
-    service_name = "adb-27021FDH200461-Idi6fc._adb-tls-connect._tcp.local."
-    mock_info = _make_mock_service_info("192.168.1.212", 41000, "Pixel 7")  # new port
-    mock_zc = MagicMock()
-    mock_zc.get_service_info.return_value = mock_info
-
-    listener.update_service(mock_zc, ADB_CONNECT_TYPE, service_name)
-
-    event = q.get_nowait()
-    assert event.kind == EventKind.ADDED
-    assert event.device.port == 41000
+def test_resolve_hostname_returns_hostname_on_failure():
+    with patch("mcpixmirror.discovery.socket.getaddrinfo", side_effect=OSError):
+        assert _resolve_hostname("Android.local") == "Android.local"
 
 
 # ------------------------------------------------------------------ #
@@ -133,37 +61,106 @@ def test_listener_update_service_treats_as_re_add():
 # ------------------------------------------------------------------ #
 
 
-def test_device_discovery_poll_returns_empty_when_no_events():
-    with patch("mcpixmirror.discovery.Zeroconf"), patch(
-        "mcpixmirror.discovery.ServiceBrowser"
-    ):
+def _make_discovery_with_browse_output(lines: list[str]) -> DeviceDiscovery:
+    """Helper: create a DeviceDiscovery whose browse process emits the given lines."""
+    mock_proc = MagicMock()
+    mock_proc.stdout = iter(lines)
+    mock_proc.kill = MagicMock()
+
+    with patch("mcpixmirror.discovery.subprocess.Popen", return_value=mock_proc):
+        d = DeviceDiscovery()
+        d.start()
+    return d
+
+
+def test_discovery_start_is_idempotent():
+    with patch("mcpixmirror.discovery.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock(stdout=iter([]), kill=MagicMock())
+        d = DeviceDiscovery()
+        d.start()
+        d.start()  # second call should be no-op
+        assert mock_popen.call_count == 1
+        d.stop()
+
+
+def test_discovery_stop_kills_process():
+    with patch("mcpixmirror.discovery.subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock(stdout=iter([]), kill=MagicMock())
+        mock_popen.return_value = mock_proc
+        d = DeviceDiscovery()
+        d.start()
+        d.stop()
+        mock_proc.kill.assert_called_once()
+        assert d._browse_proc is None
+
+
+def test_poll_returns_empty_when_no_events():
+    with patch("mcpixmirror.discovery.subprocess.Popen") as mock_popen:
+        mock_popen.return_value = MagicMock(stdout=iter([]), kill=MagicMock())
         d = DeviceDiscovery()
         d.start()
         assert d.poll() == []
         d.stop()
 
 
-def test_device_discovery_start_is_idempotent():
-    with patch("mcpixmirror.discovery.Zeroconf") as mock_zc, patch(
-        "mcpixmirror.discovery.ServiceBrowser"
-    ):
+def test_browse_reader_queues_removed_event():
+    """Rmv lines should immediately queue a REMOVED event (no lookup needed)."""
+    rmv_line = (
+        "16:12:00.000  Rmv        2  14 local.  "
+        "_adb-tls-connect._tcp.  adb-27021FDH200461-Idi6fc\n"
+    )
+    import time
+
+    with patch("mcpixmirror.discovery.subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock(stdout=iter([rmv_line]), kill=MagicMock())
+        mock_popen.return_value = mock_proc
         d = DeviceDiscovery()
         d.start()
-        d.start()  # second call should be a no-op
-        assert mock_zc.call_count == 1
+        time.sleep(0.2)  # let the reader thread process the line
+        events = d.poll()
         d.stop()
 
+    assert len(events) == 1
+    assert events[0].kind == EventKind.REMOVED
+    assert events[0].device.serial == "27021FDH200461"
 
-def test_device_discovery_stop_cleans_up():
-    with patch("mcpixmirror.discovery.Zeroconf") as mock_zc_cls, patch(
-        "mcpixmirror.discovery.ServiceBrowser"
-    ):
-        mock_zc_instance = MagicMock()
-        mock_zc_cls.return_value = mock_zc_instance
 
+def test_lookup_queues_added_event():
+    """Add lines should trigger a lookup and queue an ADDED event."""
+    import time
+
+    add_line = (
+        "16:12:00.000  Add        2  14 local.  "
+        "_adb-tls-connect._tcp.  adb-27021FDH200461-Idi6fc\n"
+    )
+    lookup_lines = [
+        "Lookup adb-27021FDH200461-Idi6fc._adb-tls-connect._tcp.local\n",
+        "  adb-27021FDH200461-Idi6fc._adb-tls-connect._tcp.local. "
+        "can be reached at Android.local.:33825 (interface 14)\n",
+        " api=36.1 name=Pixel\\ 7 v=1\n",
+    ]
+
+    browse_proc = MagicMock(stdout=iter([add_line]), kill=MagicMock())
+    lookup_proc = MagicMock(stdout=iter(lookup_lines), kill=MagicMock())
+
+    call_count = [0]
+
+    def popen_side_effect(cmd, **kwargs):
+        call_count[0] += 1
+        return browse_proc if call_count[0] == 1 else lookup_proc
+
+    with patch("mcpixmirror.discovery.subprocess.Popen", side_effect=popen_side_effect), \
+         patch("mcpixmirror.discovery._resolve_hostname", return_value="192.168.1.212"):
         d = DeviceDiscovery()
         d.start()
+        time.sleep(0.3)
+        events = d.poll()
         d.stop()
 
-        mock_zc_instance.close.assert_called_once()
-        assert d._zc is None
+    assert len(events) == 1
+    e = events[0]
+    assert e.kind == EventKind.ADDED
+    assert e.device.serial == "27021FDH200461"
+    assert e.device.ip == "192.168.1.212"
+    assert e.device.port == 33825
+    assert e.device.name == "Pixel 7"
