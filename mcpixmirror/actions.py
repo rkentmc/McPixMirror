@@ -6,6 +6,7 @@ shell out to `adb` and `scrcpy`; the connection object provides the address.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -42,72 +43,53 @@ def _adb_s(connection: AdbConnection, *args: str, timeout: int = 30) -> str:
 # ------------------------------------------------------------------ #
 
 
-def push_clipboard(connection: AdbConnection) -> str:
-    """Copy the Mac clipboard to the Android clipboard.
+# Matches http/https URLs and bare domain-like strings (e.g. claude.ai/settings)
+_URL_RE = re.compile(
+    r"^(?:https?://\S+|[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}(?:/\S*)?)$"
+)
 
-    Uses `adb shell am broadcast` with the built-in ClipboardManager intent.
-    Works for plain text. Multi-line and Unicode are supported; shell-special
-    characters are handled by passing the text through a file rather than
-    inline in the command (avoids quoting hazards).
+
+def push_clipboard(connection: AdbConnection) -> str:
+    """Send Mac clipboard content to the Pixel.
+
+    - URLs are opened directly in the Android browser via ACTION_VIEW.
+    - Plain text is sent via the Android share sheet (ACTION_SEND).
+
+    Android 10+ blocks arbitrary clipboard writes without a companion app,
+    so we avoid the clipboard API entirely and use intents instead.
 
     Returns a human-readable result message.
     """
     if not connection.is_connected:
         raise ActionError("No active ADB connection.")
 
-    # Read from macOS clipboard
     try:
         result = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
-        text = result.stdout
+        text = result.stdout.strip()
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         raise ActionError("Could not read macOS clipboard.") from e
 
     if not text:
         return "Clipboard is empty — nothing to push."
 
-    # Write to a temp file on the device, then use the Android Broadcast API.
-    # We use a temp file approach to safely handle special shell characters.
-    tmp_path = "/sdcard/.mcpixmirror_clip.txt"
-
-    # Push via stdin to avoid shell quoting issues with special chars
-    push_cmd = [cfg.adb_bin, "-s", connection.address, "shell", f"cat > {tmp_path}"]
-    try:
-        proc = subprocess.run(
-            push_cmd,
-            input=text,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if proc.returncode != 0:
-            raise ActionError(f"Could not write clipboard to device: {proc.stderr.strip()}")
-    except subprocess.TimeoutExpired as e:
-        raise ActionError("Timed out writing clipboard to device.") from e
-
-    # Use the Android service to set clipboard content from the temp file.
-    # `am broadcast` with CLIPPER_SET is the standard community approach;
-    # we fall back to a simpler `input text` for short strings if this fails.
-    broadcast_cmd = (
-        f"content=$(cat {tmp_path}); "
-        f"am broadcast -a clipper.set --es text \"$content\"; "
-        f"rm -f {tmp_path}"
-    )
-    try:
-        _adb_s(connection, "shell", broadcast_cmd)
-    except ActionError:
-        # Fallback: try input text (works for short, simple strings only)
-        # This is best-effort; truncate to avoid ADB input limits.
-        short_text = text[:200].replace("\n", " ")
-        try:
-            _adb_s(connection, "shell", "input", "text", short_text)
-        except ActionError:
-            raise ActionError(
-                "Clipboard push failed. Install the 'Clipper' app on your Pixel "
-                "for reliable clipboard sync."
-            )
-
-    preview = text[:50].replace("\n", "↵") + ("…" if len(text) > 50 else "")
-    return f"Pushed to phone: {preview!r}"
+    if _URL_RE.match(text):
+        # Open URL directly in the default browser on the Pixel.
+        # Prepend https:// if no protocol is present.
+        url = text if text.startswith(("http://", "https://")) else f"https://{text}"
+        _adb_s(connection, "shell", "am", "start",
+               "-a", "android.intent.action.VIEW", "-d", url)
+        preview = text[:60] + ("…" if len(text) > 60 else "")
+        return f"Opened on Pixel: {preview}"
+    else:
+        # Send plain text via the share sheet
+        # Escape single quotes for the shell
+        escaped = text.replace("'", "'\\''")
+        _adb_s(connection, "shell",
+               f"am start -a android.intent.action.SEND "
+               f"-t text/plain "
+               f"--es android.intent.extra.TEXT '{escaped}'")
+        preview = text[:50].replace("\n", "↵") + ("…" if len(text) > 50 else "")
+        return f"Shared to Pixel: {preview!r}"
 
 
 # ------------------------------------------------------------------ #
